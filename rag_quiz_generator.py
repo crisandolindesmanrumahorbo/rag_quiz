@@ -4,8 +4,12 @@ import requests
 import PyPDF2
 import docx
 import io
+import re
 from typing import List, Dict, Any
 import time
+
+# TODO
+# 1. change pdf lib to unstructured
 
 
 class OllamaClient:
@@ -141,82 +145,119 @@ class RAGQuizGenerator:
 
         return results["documents"][0] if results["documents"] else []
 
-    def generate_quiz_question(self, topic: str = "", difficulty: str = "medium") -> Dict[str, Any]:
-        """Generate a quiz question based on the knowledge base"""
+    def generate_quiz_questions(self, num_questions: int = 1, topic: str = "", difficulty: str = "medium") -> List[Dict[str, Any]]:
+        """Generate multiple quiz questions based on the knowledge base in one LLM call"""
 
         # Search for relevant content
         search_query = topic if topic else "general knowledge from the book"
-        relevant_docs = self.search_relevant_content(search_query, n_results=2)
+        relevant_docs = self.search_relevant_content(
+            search_query, n_results=min(5, num_questions + 2))
+        st.warning(f"Topic: {topic} relevant info got {
+            relevant_docs}.")
 
         if not relevant_docs:
-            return {"error": "No relevant content found in the knowledge base"}
+            return [{"error": "No relevant content found in the knowledge base"}]
 
         # Combine relevant documents
         context = "\n\n".join(relevant_docs)
 
-        # Create prompt for quiz generation
-        system_prompt = f"""You are an expert quiz generator. Create a multiple choice question based on the provided context.
+        # Create prompt for multiple quiz generation
+        system_prompt = f"""You are an expert quiz generator. Create {num_questions} multiple choice questions based on the provided context.
 
 Requirements:
-- Generate 1 question with 4 options (A, B, C, D)
+- Generate exactly {num_questions} questions, each with 4 options (A, B, C, D)
 - Difficulty level: {difficulty}
-- Include the correct answer
-- Provide a brief explanation
+- Include the correct answer for each question
+- Provide a brief explanation for each answer
 - Focus on {topic if topic else 'important facts from the content'}
+- Make sure questions cover different aspects of the content
+- Avoid duplicate or very similar questions
 
-Format your response EXACTLY like this:
-QUESTION: [Your question here]
+Format your response EXACTLY like this for each question:
+QUESTION 1: [Your first question here]
 A. [Option A]
 B. [Option B]
 C. [Option C]
 D. [Option D]
 ANSWER: [Letter of correct answer]
-EXPLANATION: [Brief explanation of why this is correct]"""
+EXPLANATION: [Brief explanation of why this is correct]
 
-        user_prompt = f"""Based on this context from the book, generate a quiz question:
+QUESTION 2: [Your second question here]
+A. [Option A]
+B. [Option B]
+C. [Option C]
+D. [Option D]
+ANSWER: [Letter of correct answer]
+EXPLANATION: [Brief explanation of why this is correct]
+
+Continue this pattern for all {num_questions} questions."""
+
+        user_prompt = f"""Based on this context from the book, generate {num_questions} different quiz questions:
 
 {context}
 
-Create a {difficulty} level multiple choice question."""
+Create {num_questions} {difficulty} level multiple choice questions covering different aspects of the content."""
 
-        # Generate the quiz question
+        # Generate the quiz questions
         response = self.ollama_client.generate(
             model="llama3.1:8b",
             system=system_prompt,
             prompt=user_prompt
         )
 
-        return self.parse_quiz_response(response)
+        return self.parse_multiple_quiz_response(response, num_questions)
 
-    def parse_quiz_response(self, response: str) -> Dict[str, Any]:
-        """Parse the generated quiz response"""
+    def parse_multiple_quiz_response(self, response: str, expected_questions: int) -> List[Dict[str, Any]]:
+        """Parse the generated multiple quiz response"""
         try:
+            questions = []
             lines = response.strip().split('\n')
-            quiz_data = {}
+            current_question = {}
 
             for line in lines:
                 line = line.strip()
-                if line.startswith('QUESTION:'):
-                    quiz_data['question'] = line.replace(
-                        'QUESTION:', '').strip()
+
+                # Check for question start (QUESTION 1:, QUESTION 2:, etc.)
+                if re.match(r'^QUESTION \d+:', line):
+                    # Save previous question if exists
+                    if current_question and 'question' in current_question:
+                        questions.append(current_question)
+                    # Start new question
+                    current_question = {}
+                    current_question['question'] = re.sub(
+                        r'^QUESTION \d+:', '', line).strip()
                 elif line.startswith('A.'):
-                    quiz_data['option_a'] = line.replace('A.', '').strip()
+                    current_question['option_a'] = line.replace(
+                        'A.', '').strip()
                 elif line.startswith('B.'):
-                    quiz_data['option_b'] = line.replace('B.', '').strip()
+                    current_question['option_b'] = line.replace(
+                        'B.', '').strip()
                 elif line.startswith('C.'):
-                    quiz_data['option_c'] = line.replace('C.', '').strip()
+                    current_question['option_c'] = line.replace(
+                        'C.', '').strip()
                 elif line.startswith('D.'):
-                    quiz_data['option_d'] = line.replace('D.', '').strip()
+                    current_question['option_d'] = line.replace(
+                        'D.', '').strip()
                 elif line.startswith('ANSWER:'):
-                    quiz_data['correct_answer'] = line.replace(
+                    current_question['correct_answer'] = line.replace(
                         'ANSWER:', '').strip()
                 elif line.startswith('EXPLANATION:'):
-                    quiz_data['explanation'] = line.replace(
+                    current_question['explanation'] = line.replace(
                         'EXPLANATION:', '').strip()
 
-            return quiz_data
+            # Add the last question
+            if current_question and 'question' in current_question:
+                questions.append(current_question)
+
+            # Validate we got the expected number of questions
+            if len(questions) != expected_questions:
+                st.warning(f"Expected {expected_questions} questions but got {
+                           len(questions)}. This might be due to LLM response formatting.")
+
+            return questions if questions else [{"error": "Could not parse any questions from response", "raw_response": response}]
+
         except Exception as e:
-            return {"error": f"Error parsing response: {str(e)}", "raw_response": response}
+            return [{"error": f"Error parsing response: {str(e)}", "raw_response": response}]
 
 
 def main():
@@ -230,7 +271,16 @@ def main():
     if 'rag_system' not in st.session_state:
         st.session_state.rag_system = RAGQuizGenerator()
 
-    # Sidebar for file upload and settings
+    # Quiz settings - defined at top level so accessible everywhere
+    st.sidebar.header("⚙️ Quiz Settings")
+    difficulty = st.sidebar.selectbox(
+        "Difficulty Level", ["easy", "medium", "hard"])
+    topic = st.sidebar.text_input(
+        "Specific Topic (optional)", placeholder="e.g., Indonesian History")
+    num_questions = st.sidebar.number_input(
+        "Number of Questions", min_value=1, max_value=10, value=1)
+
+    # Sidebar for file upload
     with st.sidebar:
         st.header("📁 Document Upload")
 
@@ -258,7 +308,7 @@ def main():
                     if text:
                         # Chunk the text
                         chunks = DocumentProcessor.chunk_text(text)
-                        st.write(f"Created {len(chunks)} text chunks")
+                        st.write(f"Created {len(chunks)} text {chunks}")
 
                         # Add to vector database
                         progress_bar = st.progress(0)
@@ -271,63 +321,111 @@ def main():
                     else:
                         st.error("Could not extract text from the document")
 
-        st.header("⚙️ Quiz Settings")
-        difficulty = st.selectbox(
-            "Difficulty Level", ["easy", "medium", "hard"])
-        topic = st.text_input("Specific Topic (optional)",
-                              placeholder="e.g., Indonesian History")
-
     # Main content area
     col1, col2 = st.columns([1, 1])
 
     with col1:
         st.header("🎯 Generate Quiz")
 
-        if st.button("Generate New Question", type="primary"):
-            if not hasattr(st.session_state, 'document_processed'):
+        if st.button("Generate Quiz Questions", type="primary"):
+            if not hasattr(st.session_state, 'document_processed') and st.session_state.rag_system.initialize_collection().count() == 0:
                 st.warning("Please upload and process a document first!")
             else:
-                with st.spinner("Generating quiz question..."):
-                    quiz_data = st.session_state.rag_system.generate_quiz_question(
-                        topic, difficulty)
-                    st.session_state.current_quiz = quiz_data
+                with st.spinner(f"Generating {num_questions} quiz question(s) in one request..."):
+                    # Single LLM call for multiple questions
+                    quiz_questions = st.session_state.rag_system.generate_quiz_questions(
+                        num_questions, topic, difficulty)
 
-        # Display generated quiz
-        if 'current_quiz' in st.session_state:
-            quiz = st.session_state.current_quiz
+                    st.session_state.quiz_questions = quiz_questions
+                    st.session_state.user_answers = [
+                        None] * len(quiz_questions)
+                    st.session_state.quiz_submitted = [
+                        False] * len(quiz_questions)
 
-            if 'error' in quiz:
-                st.error(f"Error: {quiz['error']}")
-                if 'raw_response' in quiz:
-                    st.text("Raw response:")
-                    st.text(quiz['raw_response'])
-            else:
-                st.subheader("📝 Quiz Question")
-                st.write(f"**Question:** {quiz.get('question', 'N/A')}")
+        # Display generated quiz questions
+        if 'quiz_questions' in st.session_state:
+            quiz_questions = st.session_state.quiz_questions
 
-                # Display options
-                st.write("**Options:**")
-                for letter in ['a', 'b', 'c', 'd']:
-                    option_key = f'option_{letter}'
-                    if option_key in quiz:
-                        st.write(f"{letter.upper()}. {quiz[option_key]}")
+            for idx, quiz in enumerate(quiz_questions):
+                st.markdown("---")
+                st.subheader(f"📝 Question {idx + 1}")
 
-                # User answer selection
-                user_answer = st.radio(
-                    "Your Answer:",
-                    ['A', 'B', 'C', 'D'],
-                    key="user_answer"
-                )
+                if 'error' in quiz:
+                    st.error(f"Error in question {idx + 1}: {quiz['error']}")
+                    if 'raw_response' in quiz:
+                        with st.expander("Show raw response"):
+                            st.text(quiz['raw_response'])
+                else:
+                    st.write(f"**Question:** {quiz.get('question', 'N/A')}")
 
-                if st.button("Submit Answer"):
-                    correct = quiz.get('correct_answer', '').upper()
-                    if user_answer == correct:
-                        st.success("✅ Correct!")
-                    else:
-                        st.error(f"❌ Wrong! The correct answer is {correct}")
+                    # Display options
+                    st.write("**Options:**")
+                    for letter in ['a', 'b', 'c', 'd']:
+                        option_key = f'option_{letter}'
+                        if option_key in quiz:
+                            st.write(f"{letter.upper()}. {quiz[option_key]}")
 
-                    st.info(
-                        f"**Explanation:** {quiz.get('explanation', 'No explanation available')}")
+                    # User answer selection
+                    user_answer = st.radio(
+                        "Your Answer:",
+                        ['A', 'B', 'C', 'D'],
+                        key=f"user_answer_{idx}"
+                    )
+
+                    if st.button(f"Submit Answer {idx + 1}", key=f"submit_{idx}"):
+                        st.session_state.user_answers[idx] = user_answer
+                        st.session_state.quiz_submitted[idx] = True
+
+                    # Show result if submitted
+                    if st.session_state.quiz_submitted[idx]:
+                        correct = quiz.get('correct_answer', '').upper()
+                        user_ans = st.session_state.user_answers[idx]
+
+                        if user_ans == correct:
+                            st.success("✅ Correct!")
+                        else:
+                            st.error(
+                                f"❌ Wrong! The correct answer is {correct}")
+
+                        st.info(
+                            f"**Explanation:** {quiz.get('explanation', 'No explanation available')}")
+
+            # Show overall score
+            if all(st.session_state.quiz_submitted):
+                st.markdown("---")
+                st.header("🎯 Quiz Results")
+
+                correct_count = 0
+                total_questions = len(quiz_questions)
+
+                for i, quiz in enumerate(quiz_questions):
+                    if 'error' not in quiz:
+                        correct_answer = quiz.get('correct_answer', '').upper()
+                        user_answer = st.session_state.user_answers[i]
+                        if user_answer == correct_answer:
+                            correct_count += 1
+
+                score_percentage = (correct_count / total_questions) * 100
+                st.metric("Final Score", f"{
+                          correct_count}/{total_questions} ({score_percentage:.1f}%)")
+
+                if score_percentage >= 80:
+                    st.balloons()
+                    st.success("🎉 Excellent work!")
+                elif score_percentage >= 60:
+                    st.success("👍 Good job!")
+                else:
+                    st.warning("📚 Keep studying!")
+
+                if st.button("Generate New Quiz"):
+                    # Clear previous quiz data
+                    if 'quiz_questions' in st.session_state:
+                        del st.session_state.quiz_questions
+                    if 'user_answers' in st.session_state:
+                        del st.session_state.user_answers
+                    if 'quiz_submitted' in st.session_state:
+                        del st.session_state.quiz_submitted
+                    st.rerun()
 
     with col2:
         st.header("📊 Knowledge Base Status")
@@ -351,6 +449,7 @@ def main():
         - The system will chunk your document and create embeddings
         - Specify topics for targeted questions
         - Try different difficulty levels
+        - Select 1-10 questions to generate at once
         - The AI uses the book content to generate relevant questions
         """)
 
