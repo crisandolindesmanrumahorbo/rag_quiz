@@ -1,20 +1,19 @@
 import streamlit as st
 import chromadb
-from chromadb.config import Settings
 import requests
-import json
 import io
 import os
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 import time
 import tempfile
 
 # Unstructured imports
 from unstructured.partition.auto import partition
 from unstructured.partition.pdf import partition_pdf
-from unstructured.chunking.title import chunk_by_title
-from unstructured.staging.base import dict_to_elements
+
+
+USE_BATCH = False  # switch between /api/embeddings and /api/embed
 
 
 class OllamaClient:
@@ -39,20 +38,45 @@ class OllamaClient:
             st.error(f"Error calling Ollama: {str(e)}")
             return ""
 
-    def embed(self, model: str, text: str) -> List[float]:
-        """Get embeddings using Ollama API"""
-        url = f"{self.base_url}/api/embeddings"
-        data = {
-            "model": model,
-            "prompt": text
-        }
+    def embed(self, model: str, texts: Union[str, List[str]]) -> List[List[float]]:
+        """get embeddings using ollama api (supports batching)"""
+
+        if USE_BATCH:
+            data = {
+                "model": model,
+                "input": texts if isinstance(texts, list) else [texts]
+            }
+            url = f"{self.base_url}/api/embed"
+
+        else:
+            data = {
+                "model": model,
+                "prompt": texts
+            }
+            url = f"{self.base_url}/api/embeddings"
+
+        st.info(f"Data: {str(data)}")
 
         try:
             response = requests.post(url, json=data, timeout=60)
             response.raise_for_status()
-            return response.json()["embedding"]
+            result = response.json()
+
+            # Ollama returns {"embedding": [...]} for single input
+            # and {"embeddings": [[...], [...]]} for batch input
+            if "embedding" in result:
+                result = result["embedding"]
+                st.info(f"Embedding: {result} ")
+                return [result]
+            elif "embeddings" in result:
+                result = result["embeddings"]
+                st.info(f"Embeddings: {result} ")
+                return result
+            else:
+                return []
+            # return response.json()["embeddings"]
         except Exception as e:
-            st.error(f"Error getting embeddings: {str(e)}")
+            st.error(f"error getting embeddings: {str(e)}")
             return []
 
 
@@ -198,22 +222,45 @@ class RAGQuizGenerator:
             st.error(f"Error resetting database: {str(e)}")
             return False
 
-    def add_documents_to_db(self, documents: List[str], progress_bar=None):
-        """Add documents to vector database"""
+    def add_documents_to_db(self, documents: List[str], progress_bar=None, batch_size: int = 20):
+        """Add documents to vector database with batching"""
         collection = self.initialize_collection()
+        total_docs = len(documents)
 
-        for i, doc in enumerate(documents):
-            if progress_bar:
-                progress_bar.progress((i + 1) / len(documents))
+        if not USE_BATCH:
+            for i, doc in enumerate(documents):
+                if progress_bar:
+                    progress_bar.progress((i + 1) / len(documents))
 
             # Get embeddings
-            embedding = self.ollama_client.embed("nomic-embed-text:v1.5", doc)
-            if embedding:
-                collection.add(
-                    documents=[doc],
-                    embeddings=[embedding],
-                    ids=[f"doc_{i}_{int(time.time())}"]
-                )
+                embedding = self.ollama_client.embed(
+                    "nomic-embed-text:v1.5", doc)
+                if embedding:
+                    collection.add(
+                        documents=[doc],
+                        embeddings=embedding,
+                        ids=[f"doc_{i}_{int(time.time())}"]
+                    )
+        else:
+            for start in range(0, total_docs, batch_size):
+                end = min(start + batch_size, total_docs)
+                batch_docs = documents[start:end]
+
+                # Get embeddings in batch
+                embeddings = self.ollama_client.embed(
+                    "nomic-embed-text:v1.5", batch_docs)
+
+                if embeddings:
+                    ids = [f"doc{idx}_{
+                        int(time.time())}" for idx in range(start, end)]
+                    collection.add(
+                        documents=batch_docs,
+                        embeddings=embeddings,
+                        ids=ids
+                    )
+
+                if progress_bar:
+                    progress_bar.progress(end / total_docs)
 
     def search_relevant_content(self, query: str, n_results: int = 3) -> List[str]:
         """Search for relevant content in the database"""
@@ -227,7 +274,7 @@ class RAGQuizGenerator:
 
         # Search for similar documents
         results = collection.query(
-            query_embeddings=[query_embedding],
+            query_embeddings=[query_embedding[0]],
             n_results=n_results
         )
 
@@ -239,7 +286,7 @@ class RAGQuizGenerator:
         # Search for relevant content
         search_query = topic if topic else "general knowledge from the book"
         relevant_docs = self.search_relevant_content(
-            search_query, n_results=min(1, num_questions + 2))
+            search_query, n_results=min(5, num_questions + 2))
 
         if not relevant_docs:
             return [{"error": "No relevant content found in the knowledge base"}]
@@ -288,7 +335,8 @@ Create {num_questions} {difficulty} level multiple choice questions covering dif
         # return None
         # Generate the quiz questions
         response = self.ollama_client.generate(
-            model="llama3.1:8b",
+            # model="llama3.1:8b",
+            model="llama3.2:3b",
             system=system_prompt,
             prompt=user_prompt
         )
@@ -428,7 +476,8 @@ def main():
                             file_content, uploaded_file.name)
                         if text:
                             chunks = DocumentProcessor.simple_chunk_text(text)
-                            st.write(f"📄 Created {len(chunks)} text chunks (fallback method)")
+                            st.write(f"📄 Created {
+                                     len(chunks)} text chunks (fallback method)")
                         else:
                             st.error(
                                 "Could not extract text from the document")
@@ -438,7 +487,7 @@ def main():
                         # Add to vector database
                         progress_bar = st.progress(0)
                         st.session_state.rag_system.add_documents_to_db(
-                            chunks, progress_bar)
+                            chunks, progress_bar, batch_size=20)
 
                         st.success(
                             "Document processed and added to knowledge base!")
